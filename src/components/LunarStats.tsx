@@ -11,24 +11,63 @@ import { Separator } from '@/components/ui/separator';
 
 interface CommitStats {
   commitsByPhase: Record<string, number>;
+  averageCommitSize: Record<string, number>;
   timeOfDay: {
     dawn: number;
     day: number;
     dusk: number;
     night: number;
   };
+  largestCommit: {
+    phase: string;
+    size: number;
+    message: string;
+    date: string;
+  };
+  totalAdditions: number;
+  totalDeletions: number;
 }
 
 export default function LunarStats() {
   const [stats, setStats] = useState<CommitStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [progress, setProgress] = useState<{ 
+    message: string; 
+    progress?: { 
+      current: number; 
+      total: number; 
+      percentage: number;
+      stats?: {
+        commitsByPhase: Record<string, number>;
+        timeOfDay: {
+          dawn: number;
+          day: number;
+          dusk: number;
+          night: number;
+        };
+        totalCommits: number;
+      }
+    } 
+  } | null>(null);
 
   useEffect(() => {
+    let eventSource: EventSource;
+
     async function fetchStats() {
       try {
         setLoading(true);
         setError(null);
+
+        // Start listening for progress updates
+        eventSource = new EventSource('/api/progress');
+        eventSource.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          setProgress(data);
+        };
+
+        // Fetch the actual data
         const response = await fetch('/api/commits');
         if (!response.ok) {
           throw new Error('Failed to fetch commit data');
@@ -39,11 +78,56 @@ export default function LunarStats() {
         setError(err instanceof Error ? err.message : 'An error occurred');
       } finally {
         setLoading(false);
+        if (eventSource) {
+          eventSource.close();
+        }
       }
     }
 
     fetchStats();
+
+    return () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+    };
   }, []);
+
+  async function fetchDetailedStats() {
+    let eventSource: EventSource | undefined;
+    try {
+      setLoadingDetails(true);
+      setError(null);
+      setProgress({ message: 'Starting detailed analysis...' });
+
+      // Start listening for progress updates
+      eventSource = new EventSource('/api/commits/details');
+      eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        console.log('Progress update:', data);
+        if (data.message || data.progress) {
+          setProgress(data);
+        }
+        // If we get a final stats object, update the stats
+        if (data.commitsByPhase && data.averageCommitSize) {
+          setStats(data);
+          eventSource?.close();
+          setLoadingDetails(false);
+        }
+      };
+      eventSource.onerror = (error) => {
+        console.error('Progress event source error:', error);
+        eventSource?.close();
+        setLoadingDetails(false);
+        setError('Failed to load detailed stats');
+      };
+    } catch (err) {
+      console.error('Error fetching detailed stats:', err);
+      setError(err instanceof Error ? err.message : 'An error occurred');
+      setLoadingDetails(false);
+      eventSource?.close();
+    }
+  }
 
   if (loading) {
     return (
@@ -79,8 +163,23 @@ export default function LunarStats() {
             <Skeleton className="h-6 w-40" />
             <Skeleton className="h-4 w-4" />
           </div>
-          <div className="text-xs uppercase tracking-wider text-muted-foreground animate-pulse">
-            Analyzing your commit history...
+          <div className="text-xs uppercase tracking-wider text-muted-foreground">
+            {progress ? (
+              <div className="space-y-2">
+                <p>{progress.message}</p>
+                {progress.progress && (
+                  <>
+                    <Progress value={progress.progress.percentage} className="h-1" />
+                    <p className="text-right text-xs text-muted-foreground">
+                      {progress.progress.current} / {progress.progress.total}
+                      {' '}({progress.progress.percentage}%)
+                    </p>
+                  </>
+                )}
+              </div>
+            ) : (
+              "Analyzing your commit history..."
+            )}
           </div>
         </div>
 
@@ -88,12 +187,21 @@ export default function LunarStats() {
           <div key={phase.name} className="space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <Skeleton className="h-6 w-6" />
-                <Skeleton className="h-4 w-24" />
+                <span className="text-lg">{phase.symbol}</span>
+                <span className="text-sm font-serif">{phase.name}</span>
               </div>
-              <Skeleton className="h-4 w-16" />
+              <span className="text-xs tracking-wider text-muted-foreground">
+                {progress?.progress?.stats?.commitsByPhase[phase.name] || 0} commits
+              </span>
             </div>
-            <Skeleton className="h-2 w-full" />
+            <Progress 
+              value={progress?.progress?.stats ? 
+                ((progress.progress.stats.commitsByPhase[phase.name] || 0) / 
+                Math.max(...Object.values(progress.progress.stats.commitsByPhase), 1)) * 100 
+                : 0
+              } 
+              className="h-1"
+            />
           </div>
         ))}
       </div>
@@ -125,23 +233,31 @@ export default function LunarStats() {
     return <div className="text-xs uppercase tracking-wider text-muted-foreground">No data available</div>;
   }
 
-  const maxCommits = Math.max(...Object.values(stats.commitsByPhase));
-  const totalCommits = Object.values(stats.commitsByPhase).reduce((a, b) => a + b, 0);
+  const maxCommits = Math.max(...Object.values(stats.commitsByPhase || {}));
+  const totalCommits = Object.values(stats.commitsByPhase || {}).reduce((a, b) => a + b, 0);
   
   // Find the dominant phase
-  const dominantPhaseName = Object.entries(stats.commitsByPhase)
-    .reduce((a, b) => (b[1] > a[1] ? b : a))[0];
-  const dominantPhase = LUNAR_PHASES.find(phase => phase.name === dominantPhaseName)!;
+  const dominantPhaseName = Object.entries(stats.commitsByPhase || {})
+    .reduce((a, b) => (b[1] > a[1] ? b : a), ['', 0])[0];
+  const dominantPhase = LUNAR_PHASES.find(phase => phase.name === dominantPhaseName) || LUNAR_PHASES[0];
 
   // Find preferred time of day
-  const maxTimeOfDay = Object.entries(stats.timeOfDay)
-    .reduce((a, b) => (b[1] > a[1] ? b : a));
+  const maxTimeOfDay = Object.entries(stats.timeOfDay || {
+    dawn: 0,
+    day: 0,
+    dusk: 0,
+    night: 0,
+  }).reduce((a, b) => (b[1] > a[1] ? b : a), ['', 0]);
   const timeIcons = {
     dawn: <Sunrise className="h-4 w-4" />,
     day: <Sun className="h-4 w-4" />,
     dusk: <Sunset className="h-4 w-4" />,
     night: <Moon className="h-4 w-4" />,
   };
+
+  // Initialize empty stats if needed
+  const commitsByPhase = stats.commitsByPhase || {};
+  const averageCommitSize = stats.averageCommitSize || {};
 
   return (
     <div className="space-y-12">
@@ -152,7 +268,7 @@ export default function LunarStats() {
             <div>
               <h3 className="font-serif text-lg">You're a {dominantPhase.name.toLowerCase()} coder</h3>
               <p className="text-sm text-muted-foreground">
-                {((stats.commitsByPhase[dominantPhaseName] / totalCommits) * 100).toFixed(0)}% of your commits occur during this phase
+                {((commitsByPhase[dominantPhaseName] / totalCommits) * 100).toFixed(0)}% of your commits occur during this phase
               </p>
             </div>
           </div>
@@ -169,11 +285,36 @@ export default function LunarStats() {
             <div>
               <div className="flex items-center gap-2 text-muted-foreground mb-1">
                 <GitCommit className="h-4 w-4" />
-                <span className="uppercase tracking-wider text-xs">Total Commits</span>
+                <span className="uppercase tracking-wider text-xs">Largest Impact</span>
               </div>
-              <p>{totalCommits} commits analyzed</p>
+              <p>{stats.largestCommit?.size || 0} changes during {stats.largestCommit?.phase?.toLowerCase() || 'any phase'}</p>
             </div>
           </div>
+          {!stats?.averageCommitSize && !loadingDetails && (
+            <div className="mt-6 text-center">
+              <button
+                onClick={fetchDetailedStats}
+                className="text-xs uppercase tracking-wider hover:opacity-70"
+              >
+                Load Detailed Stats
+              </button>
+            </div>
+          )}
+          {loadingDetails && (
+            <div className="mt-6 text-center">
+              <p className="text-xs uppercase tracking-wider text-muted-foreground">
+                {progress?.message || 'Loading detailed commit information...'}
+              </p>
+              {progress?.progress && (
+                <>
+                  <Progress className="mt-2 h-1" value={progress.progress.percentage} />
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {progress.progress.current} / {progress.progress.total} commits
+                  </p>
+                </>
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -205,15 +346,18 @@ export default function LunarStats() {
                       <h4 className="font-serif text-sm">{phase.name}</h4>
                     </div>
                     <p className="text-sm text-muted-foreground">{phase.description}</p>
+                    <div className="pt-2 text-xs text-muted-foreground">
+                      Average commit size: {averageCommitSize[phase.name] || 0} changes
+                    </div>
                   </div>
                 </HoverCardContent>
               </HoverCard>
               <span className="text-xs tracking-wider text-muted-foreground">
-                {stats.commitsByPhase[phase.name] || 0} commits
+                {commitsByPhase[phase.name] || 0} commits
               </span>
             </div>
             <Progress 
-              value={((stats.commitsByPhase[phase.name] || 0) / maxCommits) * 100} 
+              value={((commitsByPhase[phase.name] || 0) / maxCommits) * 100} 
               className="h-1"
             />
           </div>

@@ -5,9 +5,9 @@ import Bottleneck from 'bottleneck';
 // Create a limiter that respects GitHub's rate limits
 const limiter = new Bottleneck({
   maxConcurrent: 1,
-  minTime: 1000, // Minimum 1 second between requests
-  reservoir: 5000, // GitHub's default rate limit
-  reservoirRefreshAmount: 5000,
+  minTime: 250, // 250ms between requests (up to 4 requests per second)
+  reservoir: 1000, // GitHub's core API has a much higher limit
+  reservoirRefreshAmount: 1000,
   reservoirRefreshInterval: 60 * 60 * 1000, // 1 hour
 });
 
@@ -118,10 +118,58 @@ const GITHUB_SYSTEM_AUTHORS = [
   'dependabot[bot]',
 ];
 
+const encoder = new TextEncoder();
+
+// Helper function to send progress updates
+function sendProgress(message: string, progress?: { 
+  current: number; 
+  total: number; 
+  stats?: {
+    commitsByPhase: Record<string, number>;
+    timeOfDay: {
+      dawn: number;
+      day: number;
+      dusk: number;
+      night: number;
+    };
+    totalCommits: number;
+  }
+}) {
+  const controller = (global as any).progressController;
+  if (controller) {
+    const data = {
+      message,
+      ...(progress && {
+        progress: {
+          current: progress.current,
+          total: progress.total,
+          percentage: Math.round((progress.current / progress.total) * 100),
+          ...(progress.stats && { stats: progress.stats })
+        }
+      })
+    };
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+  }
+}
+
+async function fetchUserRepos(octokit: Octokit, username: string): Promise<GitHubRepo[]> {
+  return limiter.schedule(() => 
+    octokit.paginate(octokit.rest.repos.listForAuthenticatedUser, {
+      affiliation: 'owner,collaborator,organization_member',
+      sort: 'updated',
+      visibility: 'all',
+      per_page: 100,
+    })
+  ).then(repos => repos.filter(repo => !repo.fork));
+}
+
 export async function fetchUserCommits(
   accessToken: string,
   username: string,
 ): Promise<CommitStats> {
+  console.log(`Starting commit analysis for GitHub user: ${username}`);
+  sendProgress(`Starting commit analysis for ${username}...`);
+  
   const octokit = new Octokit({ auth: accessToken });
   const stats: CommitStats = {
     commitsByPhase: {},
@@ -145,21 +193,30 @@ export async function fetchUserCommits(
   try {
     // First get user's verified emails
     console.log('Fetching user emails...');
-    const { data: emails } = await octokit.rest.users.listEmailsForAuthenticatedUser();
+    sendProgress('Fetching user emails...');
+    const { data: emails } = await limiter.schedule(() => 
+      octokit.rest.users.listEmailsForAuthenticatedUser()
+    );
     const userEmails = emails
       .filter(email => email.verified)
       .map(email => email.email);
+    console.log(`Found ${userEmails.length} verified email(s)`);
+    sendProgress(`Found ${userEmails.length} verified email(s)`);
     
     console.log('Fetching repositories...');
-    const { data: repos } = await octokit.rest.repos.listForAuthenticatedUser({
-      affiliation: 'owner,collaborator,organization_member',
-      sort: 'updated',
-      visibility: 'all',
-      per_page: 100,
-    });
+    sendProgress('Fetching repositories...');
+    const repos = await limiter.schedule(() => 
+      octokit.paginate(octokit.rest.repos.listForAuthenticatedUser, {
+        affiliation: 'owner,collaborator,organization_member',
+        sort: 'updated',
+        visibility: 'all',
+        per_page: 100,
+      })
+    );
 
     const nonForkRepos = repos.filter(repo => !repo.fork);
-    console.log(`Found ${nonForkRepos.length} repositories to analyze...`);
+    console.log(`Found ${nonForkRepos.length} non-fork repositories to analyze...`);
+    sendProgress(`Found ${nonForkRepos.length} repositories to analyze`);
 
     let processedRepos = 0;
     let totalCommits = 0;
@@ -168,18 +225,28 @@ export async function fetchUserCommits(
     for (const repo of nonForkRepos) {
       try {
         processedRepos++;
-        console.log(`Processing repository ${processedRepos}/${nonForkRepos.length}...`);
+        console.log(`\nProcessing repository ${processedRepos}/${nonForkRepos.length}: ${repo.full_name}`);
+        sendProgress(`Analyzing repositories`, {
+          current: processedRepos,
+          total: nonForkRepos.length,
+          stats: {
+            commitsByPhase: stats.commitsByPhase,
+            timeOfDay: stats.timeOfDay,
+            totalCommits
+          }
+        });
 
-        // Get commits from default branch by username
-        const commits = await octokit.paginate(
-          octokit.rest.repos.listCommits,
-          {
+        // Get all commits from the repository
+        console.log('  Fetching commits...');
+        const commits = await limiter.schedule(() => 
+          octokit.paginate('GET /repos/{owner}/{repo}/commits', {
             owner: repo.owner.login,
             repo: repo.name,
             author: username,
             per_page: 100,
-          }
-        ) as GitHubCommitResponse[];
+            since: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString(), // Last year only
+          })
+        );
 
         // Filter out GitHub-generated commits
         const userCommits = commits.filter(commit => {
@@ -197,77 +264,109 @@ export async function fetchUserCommits(
           );
         });
 
-        if (userCommits.length > 0) {
-          console.log(`Found ${userCommits.length} user commits in repository...`);
-        }
-
-        // Process each commit
+        // Process basic commit info first (lunar phase, time of day)
         for (const commit of userCommits) {
-          try {
-            // Get detailed commit info including stats
-            const { data: detailedCommit } = await octokit.rest.repos.getCommit({
-              owner: repo.owner.login,
-              repo: repo.name,
-              ref: commit.sha,
-            }) as { data: DetailedCommitResponse };
+          const date = new Date(commit.commit.author?.date || '');
+          const phase = getLunarPhase(date);
+          const hour = date.getHours();
+          
+          // Count commits by phase
+          stats.commitsByPhase[phase] = (stats.commitsByPhase[phase] || 0) + 1;
+          
+          // Track time of day
+          if (hour >= 4 && hour < 8) stats.timeOfDay.dawn++;
+          else if (hour >= 8 && hour < 16) stats.timeOfDay.day++;
+          else if (hour >= 16 && hour < 20) stats.timeOfDay.dusk++;
+          else stats.timeOfDay.night++;
 
-            const date = new Date(commit.commit.author?.date || '');
-            const phase = getLunarPhase(date);
-            const hour = date.getHours();
-            
-            // Count commits by phase
-            stats.commitsByPhase[phase] = (stats.commitsByPhase[phase] || 0) + 1;
-            
-            // Track commit sizes
-            if (detailedCommit.stats) {
-              const size = detailedCommit.stats.total;
-              stats.averageCommitSize[phase] = stats.averageCommitSize[phase] || 0;
-              stats.averageCommitSize[phase] += size;
-              
-              stats.totalAdditions += detailedCommit.stats.additions;
-              stats.totalDeletions += detailedCommit.stats.deletions;
+          totalCommits++;
 
-              // Track largest commit
-              if (size > stats.largestCommit.size) {
-                stats.largestCommit = {
-                  phase,
-                  size,
-                  message: commit.commit.message,
-                  date: commit.commit.author?.date || '',
-                };
+          // Send stats update every 5 commits
+          if (totalCommits % 5 === 0) {
+            sendProgress(`Analyzing repositories`, {
+              current: processedRepos,
+              total: nonForkRepos.length,
+              stats: {
+                commitsByPhase: stats.commitsByPhase,
+                timeOfDay: stats.timeOfDay,
+                totalCommits
               }
-            }
-            
-            // Track time of day
-            if (hour >= 4 && hour < 8) stats.timeOfDay.dawn++;
-            else if (hour >= 8 && hour < 16) stats.timeOfDay.day++;
-            else if (hour >= 16 && hour < 20) stats.timeOfDay.dusk++;
-            else stats.timeOfDay.night++;
-
-            totalCommits++;
-          } catch (error) {
-            console.warn('Failed to get detailed commit info:', error);
+            });
           }
         }
+
+        // Process commits in smaller batches for detailed info
+        const BATCH_SIZE = 5; // Smaller batch size to avoid timeouts
+        for (let i = 0; i < userCommits.length; i += BATCH_SIZE) {
+          const batch = userCommits.slice(i, i + BATCH_SIZE);
+
+          // Process batch in parallel
+          const batchPromises = batch.map(commit => 
+            limiter.schedule(() => 
+              octokit.rest.repos.getCommit({
+                owner: repo.owner.login,
+                repo: repo.name,
+                ref: commit.sha,
+              })
+            )
+          );
+
+          try {
+            const batchResults = await Promise.all(batchPromises);
+            for (let j = 0; j < batchResults.length; j++) {
+              const commit = batch[j];
+              const { data: detailedCommit } = batchResults[j];
+              
+              if (detailedCommit.stats?.total) {
+                const date = new Date(commit.commit.author?.date || '');
+                const phase = getLunarPhase(date);
+                const size = detailedCommit.stats.total;
+
+                // Update sizes
+                stats.averageCommitSize[phase] = stats.averageCommitSize[phase] || 0;
+                stats.averageCommitSize[phase] += size;
+                
+                stats.totalAdditions += detailedCommit.stats.additions || 0;
+                stats.totalDeletions += detailedCommit.stats.deletions || 0;
+
+                // Track largest commit
+                if (size > stats.largestCommit.size) {
+                  stats.largestCommit = {
+                    phase,
+                    size,
+                    message: commit.commit.message,
+                    date: commit.commit.author?.date || '',
+                  };
+                }
+              }
+            }
+          } catch (error) {
+            console.warn('    Failed to process commit batch:', error);
+            // Continue with next batch even if this one failed
+          }
+        }
+
+        // Log repository completion
+        console.log(`    Processed ${userCommits.length} commits in ${repo.full_name}`);
+
       } catch (error: any) {
         // Handle specific error cases
         if (error.status === 404) {
-          // Repository not found or no access - skip silently
+          console.log('  Repository not found or no access - skipping');
           continue;
         } else if (error.status === 403) {
           // Rate limit exceeded - wait for reset
           const resetIn = parseInt(error.response?.headers?.['x-ratelimit-reset'] || '0', 10) * 1000 - Date.now();
           if (resetIn > 0) {
-            console.log(`Rate limit exceeded. Waiting ${Math.ceil(resetIn / 1000)} seconds...`);
+            console.log(`  Rate limit exceeded. Waiting ${Math.ceil(resetIn / 1000)} seconds...`);
             await new Promise(resolve => setTimeout(resolve, resetIn));
             continue;
           }
         } else if (error.status === 409) {
-          // Repository is empty
+          console.log('  Repository is empty - skipping');
           continue;
         } else {
-          // Log unexpected errors without exposing repository details
-          console.error(`Unexpected error processing repository: ${error.message}`);
+          console.error(`  Unexpected error processing repository: ${error.message}`);
           continue;
         }
       }
@@ -280,15 +379,29 @@ export async function fetchUserCommits(
       );
     });
 
-    console.log(`Analysis complete! Processed ${totalCommits} commits across ${processedRepos} repositories.`);
+    // Final analysis
+    sendProgress('Analysis complete!');
+    console.log('\nFinal Analysis:');
+    console.log(`Total commits: ${totalCommits}`);
+    console.log('Commits by phase:');
+    Object.entries(stats.commitsByPhase).forEach(([phase, count]) => {
+      console.log(`  ${phase}: ${count} commits (avg size: ${stats.averageCommitSize[phase]})`);
+    });
+    console.log('Time of day distribution:');
+    Object.entries(stats.timeOfDay).forEach(([time, count]) => {
+      console.log(`  ${time}: ${count} commits`);
+    });
+    if (stats.largestCommit.size > 0) {
+      console.log('\nLargest commit:');
+      console.log(`  ${stats.largestCommit.size} changes during ${stats.largestCommit.phase}`);
+      console.log(`  Message: ${stats.largestCommit.message}`);
+      console.log(`  Date: ${new Date(stats.largestCommit.date).toLocaleString()}`);
+    }
+
     return stats;
   } catch (error: any) {
-    if (error.status === 403) {
-      throw new Error(formatRateLimitError(error));
-    } else {
-      console.error('Error fetching repository data:', error.message);
-      throw error;
-    }
+    sendProgress(`Error: ${error.message}`);
+    throw error;
   }
 }
 
@@ -337,4 +450,124 @@ export function formatRateLimitError(error: any): string {
       : 'Rate limit exceeded. You can try again now';
   }
   return error.message || 'An unknown error occurred';
+} 
+
+export async function fetchBasicCommitStats(accessToken: string, username: string, onProgress?: (progress: any) => void) {
+  const octokit = new Octokit({ auth: accessToken });
+  const repos = await fetchUserRepos(octokit, username);
+  
+  let totalCommits = 0;
+  const commitsByPhase: Record<string, number> = {};
+  const commitsByHour: Record<number, number> = {};
+
+  for (const repo of repos) {
+    const commits = await octokit.paginate(octokit.rest.repos.listCommits, {
+      owner: repo.owner.login,
+      repo: repo.name,
+      author: username,
+      per_page: 100,
+    });
+
+    for (const commit of commits) {
+      totalCommits++;
+      const date = new Date(commit.commit.author?.date || '');
+      const phase = getLunarPhase(date);
+      const hour = date.getHours();
+
+      commitsByPhase[phase] = (commitsByPhase[phase] || 0) + 1;
+      commitsByHour[hour] = (commitsByHour[hour] || 0) + 1;
+
+      if (onProgress && totalCommits % 10 === 0) {
+        onProgress({
+          totalCommits,
+          commitsByPhase,
+          commitsByHour,
+          currentRepo: repo.name,
+        });
+      }
+    }
+  }
+
+  return {
+    totalCommits,
+    commitsByPhase,
+    commitsByHour,
+  };
+}
+
+export async function fetchDetailedCommitStats(accessToken: string, username: string, onProgress?: (progress: any) => void) {
+  console.log('Starting detailed commit analysis...');
+  const stats = await fetchBasicCommitStats(accessToken, username, onProgress);
+  console.log('Basic stats fetched, getting commit details...');
+  
+  const octokit = new Octokit({ auth: accessToken });
+  const repos = await fetchUserRepos(octokit, username);
+  console.log(`Found ${repos.length} repositories to analyze for details`);
+
+  // Add detailed stats like commit sizes
+  let totalAdditions = 0;
+  let totalDeletions = 0;
+  let largestCommit = { size: 0, message: '', date: new Date() };
+  let processedCommits = 0;
+  let totalCommits = stats.totalCommits;
+
+  for (const repo of repos) {
+    console.log(`Processing detailed stats for ${repo.name}...`);
+    const commits = await octokit.paginate(octokit.rest.repos.listCommits, {
+      owner: repo.owner.login,
+      repo: repo.name,
+      author: username,
+      per_page: 100,
+    });
+
+    for (const commit of commits) {
+      processedCommits++;
+      try {
+        const details = await octokit.rest.repos.getCommit({
+          owner: repo.owner.login,
+          repo: repo.name,
+          ref: commit.sha,
+        });
+
+        totalAdditions += details.data.stats?.additions || 0;
+        totalDeletions += details.data.stats?.deletions || 0;
+
+        const size = (details.data.stats?.additions || 0) + (details.data.stats?.deletions || 0);
+        if (size > largestCommit.size) {
+          largestCommit = {
+            size,
+            message: commit.commit.message,
+            date: new Date(commit.commit.author?.date || ''),
+          };
+        }
+
+        // Send progress update every 5 commits
+        if (processedCommits % 5 === 0) {
+          console.log(`Processed ${processedCommits}/${totalCommits} commits...`);
+          onProgress?.({
+            message: `Analyzing commit details (${processedCommits}/${totalCommits})`,
+            progress: {
+              current: processedCommits,
+              total: totalCommits,
+              percentage: Math.round((processedCommits / totalCommits) * 100)
+            }
+          });
+        }
+      } catch (error) {
+        console.error(`Error processing commit ${commit.sha}:`, error);
+      }
+    }
+  }
+
+  console.log('Detailed analysis complete!');
+  console.log(`Total additions: ${totalAdditions}, deletions: ${totalDeletions}`);
+  console.log(`Largest commit: ${largestCommit.size} changes`);
+
+  return {
+    ...stats,
+    totalAdditions,
+    totalDeletions,
+    largestCommit,
+    averageCommitSize: (totalAdditions + totalDeletions) / stats.totalCommits,
+  };
 } 
